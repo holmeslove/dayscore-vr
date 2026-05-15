@@ -70,6 +70,10 @@ let ringTrack, ringFill;
 let scorePlane, scoreCanvas, scoreCtx, scoreTexture;
 let habitPanels = [];      // { mesh, canvas, ctx, texture, habit, hovered }
 let controllers = [];
+let skyMat, sparkleMat;
+let lastScoreNormalized = 0;
+let audioCtx = null;
+const clock = new THREE.Clock();
 
 // ─── DOM ────────────────────────────────────────────────────────────────────
 const overlay    = document.getElementById('overlay');
@@ -122,7 +126,6 @@ async function boot() {
 function initScene() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(COLORS.bg);
-  scene.fog        = new THREE.Fog(COLORS.bg, 2.5, 12);
 
   camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
   camera.position.set(0, 1.6, 0);
@@ -149,6 +152,8 @@ function initScene() {
   floor.position.y = 0.001;
   scene.add(floor);
 
+  buildSky();
+  buildSparkles();
   buildRing();
   buildScorePlane();
   setupControllers();
@@ -160,6 +165,8 @@ function initScene() {
   renderer.xr.addEventListener('sessionstart', () => {
     document.body.classList.add('in-vr');
     overlay.classList.add('fade-out');
+    const ctx = ensureAudio();
+    if (ctx && ctx.state === 'suspended') ctx.resume();
   });
   renderer.xr.addEventListener('sessionend', () => {
     document.body.classList.remove('in-vr');
@@ -254,6 +261,225 @@ function updateScorePlane(score, subtext) {
   scoreTexture.needsUpdate = true;
 }
 
+// ─── Sky dome (score-reactive gradient) ────────────────────────────────────
+// A large inverted sphere with a shader that fades the void from black up
+// through gold and warm hues into a deep magenta/purple as the score grows.
+// At high scores a slow rainbow shimmer plays across the sky.
+function buildSky() {
+  const SKY_VERT = `
+    varying vec3 vWorldDir;
+    void main() {
+      vWorldDir = normalize((modelMatrix * vec4(position, 1.0)).xyz);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `;
+  // y here goes from -1 (straight down) to +1 (straight up); we remap to 0..1.
+  const SKY_FRAG = `
+    uniform float uScore;   // 0..1
+    uniform float uTime;
+    varying vec3 vWorldDir;
+
+    vec3 darkAt(float h) {
+      // very dark, slight warmth at the horizon
+      vec3 floor = vec3(0.020, 0.020, 0.024);
+      vec3 horz  = vec3(0.045, 0.040, 0.035);
+      vec3 top   = vec3(0.010, 0.010, 0.020);
+      if (h < 0.5) return mix(floor, horz, h * 2.0);
+      return mix(horz, top, (h - 0.5) * 2.0);
+    }
+
+    vec3 brightAt(float h) {
+      // bottom: deep amber → horizon: bright gold → mid: rose →
+      // upper: violet → top: indigo
+      vec3 amber  = vec3(0.55, 0.25, 0.06);
+      vec3 gold   = vec3(1.00, 0.72, 0.22);
+      vec3 rose   = vec3(0.95, 0.40, 0.55);
+      vec3 violet = vec3(0.45, 0.20, 0.70);
+      vec3 indigo = vec3(0.10, 0.05, 0.30);
+      if (h < 0.30) return mix(amber, gold, h / 0.30);
+      if (h < 0.55) return mix(gold, rose,   (h - 0.30) / 0.25);
+      if (h < 0.80) return mix(rose, violet, (h - 0.55) / 0.25);
+      return mix(violet, indigo, (h - 0.80) / 0.20);
+    }
+
+    void main() {
+      float h = clamp(vWorldDir.y * 0.5 + 0.5, 0.0, 1.0);
+      vec3 dark   = darkAt(h);
+      vec3 bright = brightAt(h);
+      vec3 col    = mix(dark, bright, smoothstep(0.0, 1.0, uScore));
+
+      // Subtle rainbow shimmer at the top of the score range.
+      float shimmerStrength = smoothstep(0.65, 1.0, uScore) * 0.18;
+      float a = vWorldDir.x * 1.7 + vWorldDir.z * 0.9 + uTime * 0.25;
+      vec3 rainbow = vec3(
+        0.5 + 0.5 * sin(a),
+        0.5 + 0.5 * sin(a + 2.094),
+        0.5 + 0.5 * sin(a + 4.189)
+      );
+      col += rainbow * shimmerStrength * h;
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  skyMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uScore: { value: 0 },
+      uTime:  { value: 0 },
+    },
+    vertexShader:   SKY_VERT,
+    fragmentShader: SKY_FRAG,
+    side: THREE.BackSide,
+    depthWrite: false,
+  });
+
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(40, 48, 32), skyMat);
+  sky.renderOrder = -1; // draw first so everything else composites over it
+  scene.add(sky);
+}
+
+// ─── Sparkles (score-reactive) ─────────────────────────────────────────────
+// Points scattered around the upper hemisphere. Their size and opacity scale
+// with score, and each one twinkles on its own phase.
+function buildSparkles() {
+  const COUNT = 700;
+  const positions = new Float32Array(COUNT * 3);
+  const offsets   = new Float32Array(COUNT);
+  const tints     = new Float32Array(COUNT * 3);
+
+  for (let i = 0; i < COUNT; i++) {
+    // Roughly upper-hemisphere distribution, biased a bit upward
+    const theta = Math.random() * Math.PI * 2;
+    const phi   = Math.acos(1 - Math.random() * 1.15); // 0 (up) .. ~π/2 (horizon)
+    const r     = 14 + Math.random() * 14;
+    positions[i * 3 + 0] = r * Math.sin(phi) * Math.cos(theta);
+    positions[i * 3 + 1] = r * Math.cos(phi);
+    positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+    offsets[i] = Math.random() * Math.PI * 2;
+
+    // Slight color variety: gold, rose, violet, white
+    const palette = [
+      [1.00, 0.85, 0.45],
+      [1.00, 0.55, 0.60],
+      [0.75, 0.60, 1.00],
+      [1.00, 1.00, 0.95],
+    ];
+    const p = palette[i % palette.length];
+    tints[i * 3 + 0] = p[0];
+    tints[i * 3 + 1] = p[1];
+    tints[i * 3 + 2] = p[2];
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('offset',   new THREE.BufferAttribute(offsets, 1));
+  geo.setAttribute('tint',     new THREE.BufferAttribute(tints, 3));
+
+  sparkleMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uScore: { value: 0 },
+      uTime:  { value: 0 },
+      uPixelRatio: { value: window.devicePixelRatio },
+    },
+    vertexShader: `
+      uniform float uScore;
+      uniform float uTime;
+      uniform float uPixelRatio;
+      attribute float offset;
+      attribute vec3 tint;
+      varying float vAlpha;
+      varying vec3 vTint;
+      void main() {
+        vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPos;
+        float twinkle = 0.4 + 0.6 * sin(uTime * 1.8 + offset * 6.0);
+        float gate = smoothstep(0.05, 0.9, uScore);
+        vAlpha = gate * twinkle;
+        vTint = tint;
+        gl_PointSize = (4.0 + 10.0 * twinkle) * gate * uPixelRatio;
+      }
+    `,
+    fragmentShader: `
+      varying float vAlpha;
+      varying vec3 vTint;
+      void main() {
+        vec2 c = gl_PointCoord - vec2(0.5);
+        float d = length(c);
+        if (d > 0.5) discard;
+        // Soft round dot with a hot center
+        float a = pow(1.0 - d * 2.0, 1.8) * vAlpha;
+        gl_FragColor = vec4(vTint, a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const sparkles = new THREE.Points(geo, sparkleMat);
+  scene.add(sparkles);
+}
+
+// ─── Score → visuals (single source of truth for ring, score, sky, sparkles) ─
+function updateScoreVisuals(score, subtext) {
+  updateRing(score);
+  updateScorePlane(score, subtext);
+  const normalized = Math.max(0, Math.min(1, score / 100));
+  lastScoreNormalized = normalized;
+  if (skyMat)     skyMat.uniforms.uScore.value     = normalized;
+  if (sparkleMat) sparkleMat.uniforms.uScore.value = normalized;
+}
+
+// ─── Audio (Web Audio synth — no asset file) ───────────────────────────────
+function ensureAudio() {
+  if (audioCtx) return audioCtx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  audioCtx = new AC();
+  return audioCtx;
+}
+
+// A rising arpeggio of sparkly triangle waves — C5-E5-G5-C6-E6 — with a
+// short shimmer of higher partials on top. Cheap, no asset, plays in VR.
+function playMagicChime() {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume();
+  const now = ctx.currentTime;
+
+  const master = ctx.createGain();
+  master.gain.value = 0.5;
+  master.connect(ctx.destination);
+
+  const notes = [523.25, 659.25, 783.99, 1046.5, 1318.5];
+  notes.forEach((freq, i) => {
+    const start = now + i * 0.045;
+    const end   = start + 0.55;
+    const osc   = ctx.createOscillator();
+    const gain  = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(0.18, start + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+    osc.connect(gain).connect(master);
+    osc.start(start);
+    osc.stop(end + 0.02);
+
+    // Shimmer partial at 2x freq, quieter
+    const osc2 = ctx.createOscillator();
+    const g2   = ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.value = freq * 2;
+    g2.gain.setValueAtTime(0, start);
+    g2.gain.linearRampToValueAtTime(0.05, start + 0.01);
+    g2.gain.exponentialRampToValueAtTime(0.0001, end - 0.1);
+    osc2.connect(g2).connect(master);
+    osc2.start(start);
+    osc2.stop(end);
+  });
+}
+
 // ─── Habit panels ───────────────────────────────────────────────────────────
 function buildHabitPanels(habits) {
   habitPanels.forEach(p => {
@@ -273,8 +499,7 @@ function buildHabitPanels(habits) {
   });
 
   const score = calcScore(enriched);
-  updateRing(score);
-  updateScorePlane(score, scoreSubtext(enriched, score));
+  updateScoreVisuals(score, scoreSubtext(enriched, score));
 }
 
 function buildPanel(habit, index, total) {
@@ -543,17 +768,22 @@ function toggleHabit(panel) {
   habit.done = !habit.done;
   drawPanel(panel);
 
+  // Celebrate on the upward toggle only
+  if (habit.done) playMagicChime();
+
   // Recompute score from the freshly-toggled content
   const enriched = enrichWithPoints(parse(remoteContent));
   const score = calcScore(enriched);
-  updateRing(score);
-  updateScorePlane(score, scoreSubtext(enriched, score));
+  updateScoreVisuals(score, scoreSubtext(enriched, score));
 
   sbSave(planId, currentDate, remoteContent);
 }
 
 // ─── Animation loop ─────────────────────────────────────────────────────────
 function tick() {
+  const t = clock.getElapsedTime();
+  if (skyMat)     skyMat.uniforms.uTime.value     = t;
+  if (sparkleMat) sparkleMat.uniforms.uTime.value = t;
   if (renderer.xr.isPresenting) updateHover();
   renderer.render(scene, camera);
 }
