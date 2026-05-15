@@ -76,6 +76,10 @@ let skyMat, sparkleMat, floorMat;
 let lastScoreNormalized = 0;
 let audioCtx = null;
 const clock = new THREE.Clock();
+let elapsedTime = 0;          // accumulated from getDelta() so it doesn't fight locomotion
+let baseReferenceSpace = null; // captured on sessionstart, offset each frame for joystick locomotion
+const MOVE_SPEED = 1.6;       // metres / second
+const STICK_DEADZONE = 0.15;
 
 // ─── DOM ────────────────────────────────────────────────────────────────────
 const overlay    = document.getElementById('overlay');
@@ -161,10 +165,12 @@ function initScene() {
     overlay.classList.add('fade-out');
     const ctx = ensureAudio();
     if (ctx && ctx.state === 'suspended') ctx.resume();
+    baseReferenceSpace = renderer.xr.getReferenceSpace();
   });
   renderer.xr.addEventListener('sessionend', () => {
     document.body.classList.remove('in-vr');
     overlay.classList.remove('fade-out');
+    baseReferenceSpace = null;
   });
 
   renderer.setAnimationLoop(tick);
@@ -283,32 +289,38 @@ function buildFloor() {
 
       float ang = atan(c.y, c.x);
 
-      // Base frosted color — cool teal, warms slightly with score.
-      vec3 cool = vec3(0.045, 0.085, 0.115);
-      vec3 warm = vec3(0.18, 0.13, 0.08);
-      vec3 col  = mix(cool, warm, smoothstep(0.0, 0.7, uScore) * 0.5);
+      // Score-driven life. Floor is nearly dead at 0, fully alive at 1.
+      float life        = smoothstep(0.0, 1.0, uScore);
+      float patternLife = mix(0.12, 1.0, life); // patterns dim at low score
+
+      // Base shifts from very dark indigo to warm frosted gold with score.
+      vec3 baseDark  = vec3(0.012, 0.016, 0.024);
+      vec3 baseLight = vec3(0.18,  0.14,  0.08);
+      vec3 col = mix(baseDark, baseLight, life);
 
       // Concentric pulse rings flowing outward
       float ringPhase = r * 14.0 - uTime * 0.55;
       float rings = pow(sin(ringPhase) * 0.5 + 0.5, 10.0);
-      vec3 ringTint = mix(vec3(0.30, 0.65, 0.95), vec3(1.00, 0.75, 0.35), uScore);
-      col += ringTint * rings * 0.35;
+      vec3 ringTint = mix(vec3(0.30, 0.65, 0.95), vec3(1.00, 0.75, 0.35), life);
+      col += ringTint * rings * 0.40 * patternLife;
 
       // 12 radial spokes — soft bright lines
       float spokeMask = pow(1.0 - abs(sin(ang * 6.0)), 90.0);
-      col += vec3(0.35, 0.65, 0.90) * spokeMask * 0.12;
+      col += vec3(0.35, 0.65, 0.90) * spokeMask * 0.14 * patternLife;
 
-      // Faint hex grid
+      // Faint hex grid (always slightly visible for surface texture)
       vec2 hp = c * 22.0;
       vec2 q  = vec2(hp.x * 1.1547005, hp.y + hp.x * 0.5);
       vec2 qf = fract(q) - 0.5;
       float hexEdge = smoothstep(0.42, 0.50, max(abs(qf.x), abs(qf.y)));
-      col += vec3(0.12, 0.20, 0.28) * hexEdge * 0.45;
+      col += vec3(0.12, 0.20, 0.28) * hexEdge * 0.40 * mix(0.25, 1.0, life);
 
-      // Central pulsing core
+      // Central pulsing core — almost off at 0, bright at 1
       float corePulse = 0.5 + 0.5 * sin(uTime * 1.4);
       float core = smoothstep(0.28, 0.0, r);
-      col += vec3(0.40, 0.70, 1.00) * core * (0.25 + 0.30 * corePulse);
+      col += vec3(0.40, 0.70, 1.00) * core
+           * (0.04 + 0.45 * life)
+           * (0.5 + 0.5 * corePulse);
 
       // Frosted-glass micro-noise for surface texture
       float n = hash(floor(vUv * 1400.0));
@@ -921,13 +933,71 @@ function toggleHabit(panel) {
   sbSave(planId, currentDate, remoteContent);
 }
 
+// ─── Locomotion (left thumbstick → smooth movement) ────────────────────────
+// Standard WebXR pattern: don't move the camera; offset the reference space
+// each frame so the user's tracked pose maps to a new virtual position.
+// Forward is the headset's facing direction projected onto the XZ plane.
+const _tmpForward = new THREE.Vector3();
+const _tmpRight   = new THREE.Vector3();
+
+function handleLocomotion(dt) {
+  if (!baseReferenceSpace) return;
+  const session = renderer.xr.getSession();
+  if (!session) return;
+
+  let stickX = 0;
+  let stickY = 0;
+
+  for (const src of session.inputSources) {
+    if (!src.gamepad || src.handedness !== 'left') continue;
+    const a = src.gamepad.axes;
+    if (a.length < 4) continue;
+    // axes[2] = thumbstick X (-1 left, +1 right)
+    // axes[3] = thumbstick Y (-1 up/forward, +1 down/back)
+    const x = a[2];
+    const y = a[3];
+    const mag = Math.hypot(x, y);
+    if (mag < STICK_DEADZONE) continue;
+    // Radial deadzone with re-normalisation so motion ramps smoothly from 0
+    const t = (mag - STICK_DEADZONE) / (1 - STICK_DEADZONE);
+    stickX = (x / mag) * t;
+    stickY = (y / mag) * t;
+    break;
+  }
+
+  if (stickX === 0 && stickY === 0) return;
+
+  // Headset forward in world XZ
+  renderer.xr.getCamera().getWorldDirection(_tmpForward);
+  _tmpForward.y = 0;
+  if (_tmpForward.lengthSq() < 0.0001) return;
+  _tmpForward.normalize();
+  _tmpRight.set(-_tmpForward.z, 0, _tmpForward.x); // 90° CW from forward
+
+  // Move vector: stick-up moves along +forward, stick-right moves along +right
+  const dx = (_tmpRight.x * stickX - _tmpForward.x * stickY) * MOVE_SPEED * dt;
+  const dz = (_tmpRight.z * stickX - _tmpForward.z * stickY) * MOVE_SPEED * dt;
+
+  // To move user by V, shift the reference space origin by -V
+  const offset = new XRRigidTransform(
+    { x: -dx, y: 0, z: -dz, w: 1 },
+    { x: 0, y: 0, z: 0, w: 1 }
+  );
+  baseReferenceSpace = baseReferenceSpace.getOffsetReferenceSpace(offset);
+  renderer.xr.setReferenceSpace(baseReferenceSpace);
+}
+
 // ─── Animation loop ─────────────────────────────────────────────────────────
 function tick() {
-  const t = clock.getElapsedTime();
-  if (skyMat)     skyMat.uniforms.uTime.value     = t;
-  if (sparkleMat) sparkleMat.uniforms.uTime.value = t;
-  if (floorMat)   floorMat.uniforms.uTime.value   = t;
-  if (renderer.xr.isPresenting) updateHover();
+  const dt = clock.getDelta();
+  elapsedTime += dt;
+  if (skyMat)     skyMat.uniforms.uTime.value     = elapsedTime;
+  if (sparkleMat) sparkleMat.uniforms.uTime.value = elapsedTime;
+  if (floorMat)   floorMat.uniforms.uTime.value   = elapsedTime;
+  if (renderer.xr.isPresenting) {
+    updateHover();
+    handleLocomotion(dt);
+  }
   animatePanels();
   renderer.render(scene, camera);
 }
