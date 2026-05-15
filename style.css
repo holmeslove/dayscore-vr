@@ -1,0 +1,115 @@
+/* ─── DayScore VR — 2D overlay (pre-VR launch screen) ─────────────────────── */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #0d0d0b;
+  color: #ebebdf;
+  font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  background: #0d0d0b;
+  transition: opacity 0.4s ease;
+}
+
+#overlay.fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.5rem;
+  text-align: center;
+  padding: 2rem;
+  max-width: 28rem;
+}
+
+#title {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: #a8a89a;
+}
+
+#status {
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 1.4rem;
+  font-weight: 500;
+  color: #ebebdf;
+  line-height: 1.4;
+}
+
+#hint {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  color: #555550;
+  line-height: 1.6;
+}
+
+#hint strong {
+  color: #a8a89a;
+  font-weight: 500;
+}
+
+#vr-button-wrap {
+  margin-top: 0.5rem;
+  min-height: 3.5rem;
+  display: flex;
+  align-items: center;
+}
+
+/* Override Three.js default VRButton styling to match DayScore aesthetic */
+#vr-button-wrap button {
+  position: static !important;
+  left: auto !important;
+  bottom: auto !important;
+  transform: none !important;
+  font-family: 'IBM Plex Mono', monospace !important;
+  font-size: 0.85rem !important;
+  letter-spacing: 0.12em !important;
+  text-transform: uppercase !important;
+  background: #ebebdf !important;
+  color: #0d0d0b !important;
+  border: none !important;
+  outline: none !important;
+  padding: 0.85rem 1.6rem !important;
+  border-radius: 4px !important;
+  cursor: pointer !important;
+  opacity: 1 !important;
+  transition: opacity 0.2s, transform 0.1s !important;
+}
+
+#vr-button-wrap button:hover {
+  opacity: 0.85 !important;
+}
+
+#vr-button-wrap button:active {
+  transform: scale(0.98) !important;
+}
+
+#footer {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  color: #3a3a36;
+  margin-top: 0.5rem;
+}
+
+/* Hide overlay text once we're in VR */
+body.in-vr #overlay { display: none; }
