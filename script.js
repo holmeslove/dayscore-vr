@@ -72,7 +72,9 @@ let ringTrack, ringFill;
 let scorePlane, scoreCanvas, scoreCtx, scoreTexture;
 let habitPanels = [];      // { group, caseMesh, screenMesh, canvas, ctx, texture, habit, hovered, scale, scaleVel, pressBoost, emissiveTarget }
 let controllers = [];
-let skyMat, sparkleMat, floorMat;
+let skyMat, sparkleMat, floorMat, tronGridMat;
+let pillars = [];          // [{ mesh, baseY, phase, color }]
+let floatingShapes = [];   // [{ wire, baseY, bobPhase, rotSpeed, rotAxis }]
 let lastScoreNormalized = 0;
 let audioCtx = null;
 const clock = new THREE.Clock();
@@ -80,6 +82,13 @@ let elapsedTime = 0;          // accumulated from getDelta() so it doesn't fight
 let baseReferenceSpace = null; // captured on sessionstart, offset each frame for joystick locomotion
 const MOVE_SPEED = 1.6;       // metres / second
 const STICK_DEADZONE = 0.15;
+
+// Background music
+const bgMusic = document.getElementById('bg-music');
+const MUSIC_VOLUME = 0.32;
+let musicFadeRAF = null;
+let musicStarted = false;
+if (bgMusic) bgMusic.volume = 0;
 
 // ─── DOM ────────────────────────────────────────────────────────────────────
 const overlay    = document.getElementById('overlay');
@@ -133,7 +142,7 @@ function initScene() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(COLORS.bg);
 
-  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 120);
   camera.position.set(0, 1.6, 0);
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -150,8 +159,11 @@ function initScene() {
   scene.add(dir);
 
   buildFloor();
+  buildTronGrid();
   buildSky();
   buildSparkles();
+  buildPillars();
+  buildFloatingShapes();
   buildRing();
   buildScorePlane();
   setupControllers();
@@ -166,11 +178,13 @@ function initScene() {
     const ctx = ensureAudio();
     if (ctx && ctx.state === 'suspended') ctx.resume();
     baseReferenceSpace = renderer.xr.getReferenceSpace();
+    startMusic();
   });
   renderer.xr.addEventListener('sessionend', () => {
     document.body.classList.remove('in-vr');
     overlay.classList.remove('fade-out');
     baseReferenceSpace = null;
+    // Leave music playing on session end so the desktop preview keeps the vibe.
   });
 
   renderer.setAnimationLoop(tick);
@@ -510,15 +524,245 @@ function buildSparkles() {
   scene.add(sparkles);
 }
 
+// ─── Tron grid (large neon floor extending past the frosted disc) ──────────
+// A 100×100 m plane laid just below the frosted disc. Shader draws a minor
+// 1 m grid and a major 5 m grid in glowing cyan/amber, with a slow pulse
+// wave travelling outward from the user. Discarded near the centre so the
+// frosted disc has room to shine, and fades out by 50 m so the world has a
+// clean horizon.
+function buildTronGrid() {
+  const GRID_VERT = `
+    varying vec2 vWorldXZ;
+    void main() {
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorldXZ = wp.xz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `;
+  const GRID_FRAG = `
+    uniform float uTime;
+    uniform float uScore;
+    varying vec2 vWorldXZ;
+    void main() {
+      float dist = length(vWorldXZ);
+      if (dist < 2.6) discard;            // leave room for the frosted disc
+      if (dist > 55.0) discard;
+
+      // Minor grid lines (1 m)
+      vec2 m = abs(fract(vWorldXZ) - 0.5);
+      float minorLine = max(
+        smoothstep(0.46, 0.50, m.x),
+        smoothstep(0.46, 0.50, m.y)
+      );
+
+      // Major grid lines (5 m)
+      vec2 M = abs(fract(vWorldXZ / 5.0) - 0.5);
+      float majorLine = max(
+        smoothstep(0.46, 0.50, M.x),
+        smoothstep(0.46, 0.50, M.y)
+      );
+
+      // Distance fades — near (just past disc) and far (horizon)
+      float nearFade = smoothstep(2.6, 4.5, dist);
+      float farFade  = smoothstep(50.0, 28.0, dist);
+      float fade = nearFade * farFade;
+
+      // Score-driven life
+      float life = smoothstep(0.0, 1.0, uScore);
+
+      // Colours shift cool → warm with score
+      vec3 minorCol = mix(vec3(0.05, 0.45, 0.80), vec3(0.40, 0.85, 1.00), life);
+      vec3 majorCol = mix(vec3(0.20, 0.70, 1.00), vec3(1.00, 0.65, 0.30), life);
+
+      vec3 col = minorCol * minorLine * 0.45 + majorCol * majorLine * 0.95;
+
+      // Pulse wave radiating outward
+      float pulse = pow(sin(dist * 0.35 - uTime * 1.4) * 0.5 + 0.5, 6.0);
+      col += vec3(0.30, 0.85, 1.00) * pulse * (minorLine * 0.35 + majorLine * 0.3) * life;
+
+      // Brightness scales with score
+      col *= mix(0.35, 1.5, life);
+
+      float alpha = (minorLine * 0.45 + majorLine * 0.95) * fade;
+      gl_FragColor = vec4(col, alpha);
+    }
+  `;
+
+  tronGridMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:  { value: 0 },
+      uScore: { value: 0 },
+    },
+    vertexShader:   GRID_VERT,
+    fragmentShader: GRID_FRAG,
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+
+  const grid = new THREE.Mesh(new THREE.PlaneGeometry(110, 110), tronGridMat);
+  grid.rotation.x = -Math.PI / 2;
+  grid.position.y = 0.0006;
+  grid.renderOrder = -1;
+  scene.add(grid);
+}
+
+// ─── Pillars (ring of glowing energy spires around the user) ───────────────
+function buildPillars() {
+  const COUNT = 12;
+  const palette = [
+    [0.20, 0.85, 1.00],  // cyan
+    [1.00, 0.30, 0.70],  // magenta
+    [0.55, 1.00, 0.80],  // teal
+    [1.00, 0.65, 0.25],  // amber
+  ];
+
+  for (let i = 0; i < COUNT; i++) {
+    // Mostly even ring with a touch of jitter
+    const angle  = (i / COUNT) * Math.PI * 2 + (Math.random() - 0.5) * 0.12;
+    const radius = 11 + Math.random() * 6;
+    const height = 4.5 + Math.random() * 2.5;
+    const x = Math.cos(angle) * radius;
+    const z = Math.sin(angle) * radius;
+    const c = palette[i % palette.length];
+
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(c[0], c[1], c[2]),
+      transparent: true,
+      opacity: 0.6,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.07, 0.07, height, 6),
+      mat
+    );
+    const baseY = height / 2 + 0.6 + Math.random() * 0.4;
+    mesh.position.set(x, baseY, z);
+    scene.add(mesh);
+
+    pillars.push({
+      mesh, baseY,
+      phase: Math.random() * Math.PI * 2,
+    });
+  }
+}
+
+// ─── Floating wireframe shapes ─────────────────────────────────────────────
+function buildFloatingShapes() {
+  const configs = [
+    { type: 'icosahedron',  size: 0.55, pos: [-3.5, 2.8, -4.0], color: 0x00ffff },
+    { type: 'octahedron',   size: 0.70, pos: [ 4.5, 3.3, -3.5], color: 0xff66cc },
+    { type: 'box',          size: 0.60, pos: [ 3.2, 4.8,  4.5], color: 0x66ffaa },
+    { type: 'tetrahedron',  size: 0.85, pos: [-4.5, 2.2,  4.8], color: 0xffaa33 },
+    { type: 'dodecahedron', size: 0.55, pos: [ 0.5, 5.4,  6.5], color: 0xaa88ff },
+    { type: 'icosahedron',  size: 0.45, pos: [ 5.8, 3.5,  1.2], color: 0x66ffff },
+    { type: 'octahedron',   size: 0.55, pos: [-6.2, 4.1, -1.0], color: 0xffd166 },
+  ];
+
+  for (const cfg of configs) {
+    let src;
+    switch (cfg.type) {
+      case 'icosahedron':  src = new THREE.IcosahedronGeometry(cfg.size, 0);  break;
+      case 'octahedron':   src = new THREE.OctahedronGeometry(cfg.size, 0);   break;
+      case 'box':          src = new THREE.BoxGeometry(cfg.size, cfg.size, cfg.size); break;
+      case 'tetrahedron':  src = new THREE.TetrahedronGeometry(cfg.size, 0);  break;
+      case 'dodecahedron': src = new THREE.DodecahedronGeometry(cfg.size, 0); break;
+    }
+    const edges = new THREE.EdgesGeometry(src);
+    src.dispose();
+
+    const mat = new THREE.LineBasicMaterial({
+      color: cfg.color,
+      transparent: true,
+      opacity: 0.75,
+    });
+    const wire = new THREE.LineSegments(edges, mat);
+    wire.position.set(...cfg.pos);
+    scene.add(wire);
+
+    floatingShapes.push({
+      wire,
+      baseY:    cfg.pos[1],
+      bobPhase: Math.random() * Math.PI * 2,
+      rotSpeed: 0.15 + Math.random() * 0.30,
+      rotAxis:  new THREE.Vector3(
+        Math.random() - 0.5,
+        Math.random() - 0.5,
+        Math.random() - 0.5
+      ).normalize(),
+    });
+  }
+}
+
+function updatePillars(t, scoreNorm) {
+  for (const p of pillars) {
+    p.mesh.position.y = p.baseY + Math.sin(t * 0.7 + p.phase) * 0.12;
+    const pulse = 0.55 + 0.45 * Math.sin(t * 1.2 + p.phase * 1.7);
+    p.mesh.material.opacity = (0.25 + 0.6 * scoreNorm) * pulse;
+  }
+}
+
+function updateFloatingShapes(t, dt, scoreNorm) {
+  for (const s of floatingShapes) {
+    s.wire.rotateOnAxis(s.rotAxis, dt * s.rotSpeed);
+    s.wire.position.y = s.baseY + Math.sin(t * 0.45 + s.bobPhase) * 0.20;
+    s.wire.material.opacity = 0.35 + 0.55 * scoreNorm;
+  }
+}
+
+// ─── Music (HTML <audio>, faded in/out across VR sessions) ─────────────────
+function fadeMusicTo(target, durMs) {
+  if (!bgMusic) return;
+  if (musicFadeRAF) cancelAnimationFrame(musicFadeRAF);
+  const startVol = bgMusic.volume;
+  const startT   = performance.now();
+  function step() {
+    const t = Math.min(1, (performance.now() - startT) / durMs);
+    bgMusic.volume = startVol + (target - startVol) * t;
+    if (t < 1) {
+      musicFadeRAF = requestAnimationFrame(step);
+    } else {
+      musicFadeRAF = null;
+      if (target === 0) bgMusic.pause();
+    }
+  }
+  step();
+}
+
+function startMusic() {
+  if (!bgMusic || musicStarted) {
+    if (bgMusic && bgMusic.paused) bgMusic.play().catch(() => {});
+    fadeMusicTo(MUSIC_VOLUME, 2200);
+    return;
+  }
+  bgMusic.play().then(() => {
+    musicStarted = true;
+    fadeMusicTo(MUSIC_VOLUME, 2200);
+  }).catch(() => {/* autoplay blocked — will retry on next user gesture */});
+}
+
+function stopMusic() {
+  fadeMusicTo(0, 800);
+}
+
+// Kick the music off on first user click anywhere — covers desktop preview
+// users who never enter VR. Once started it loops continuously via the
+// <audio loop> attribute.
+window.addEventListener('click', () => {
+  if (!musicStarted) startMusic();
+}, { once: false });
+
 // ─── Score → visuals (single source of truth for ring, score, sky, sparkles) ─
 function updateScoreVisuals(score, subtext) {
   updateRing(score);
   updateScorePlane(score, subtext);
   const normalized = Math.max(0, Math.min(1, score / 100));
   lastScoreNormalized = normalized;
-  if (skyMat)     skyMat.uniforms.uScore.value     = normalized;
-  if (sparkleMat) sparkleMat.uniforms.uScore.value = normalized;
-  if (floorMat)   floorMat.uniforms.uScore.value   = normalized;
+  if (skyMat)      skyMat.uniforms.uScore.value      = normalized;
+  if (sparkleMat)  sparkleMat.uniforms.uScore.value  = normalized;
+  if (floorMat)    floorMat.uniforms.uScore.value    = normalized;
+  if (tronGridMat) tronGridMat.uniforms.uScore.value = normalized;
 }
 
 // ─── Audio (Web Audio synth — no asset file) ───────────────────────────────
@@ -991,9 +1235,12 @@ function handleLocomotion(dt) {
 function tick() {
   const dt = clock.getDelta();
   elapsedTime += dt;
-  if (skyMat)     skyMat.uniforms.uTime.value     = elapsedTime;
-  if (sparkleMat) sparkleMat.uniforms.uTime.value = elapsedTime;
-  if (floorMat)   floorMat.uniforms.uTime.value   = elapsedTime;
+  if (skyMat)      skyMat.uniforms.uTime.value      = elapsedTime;
+  if (sparkleMat)  sparkleMat.uniforms.uTime.value  = elapsedTime;
+  if (floorMat)    floorMat.uniforms.uTime.value    = elapsedTime;
+  if (tronGridMat) tronGridMat.uniforms.uTime.value = elapsedTime;
+  updatePillars(elapsedTime, lastScoreNormalized);
+  updateFloatingShapes(elapsedTime, dt, lastScoreNormalized);
   if (renderer.xr.isPresenting) {
     updateHover();
     handleLocomotion(dt);
