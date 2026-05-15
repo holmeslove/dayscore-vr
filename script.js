@@ -53,8 +53,8 @@ const COLORS = {
 const RING_RADIUS    = 0.32;
 const RING_TUBE      = 0.018;
 const RING_POSITION  = new THREE.Vector3(0, 1.85, -1.15);
-const HABIT_W        = 0.52;
-const HABIT_H        = 0.13;
+const HABIT_W        = 0.44;
+const HABIT_H        = 0.11;
 const CANVAS_W       = 2048;
 const CANVAS_H       = Math.round(CANVAS_W * (HABIT_H / HABIT_W));
 
@@ -306,21 +306,40 @@ function buildPanel(habit, index, total) {
 }
 
 function positionPanel(mesh, index, total) {
-  const useTwoRows = total > 6;
-  const cols = useTwoRows ? Math.ceil(total / 2) : total;
-  const row  = useTwoRows ? Math.floor(index / cols) : 0;
-  const col  = useTwoRows ? index % cols : index;
+  // Layout strategy:
+  //   ≤5 habits   → 1 row
+  //   6–10 habits → 2 rows
+  //   11+         → 3 rows
+  const rows = total <= 5 ? 1 : total <= 10 ? 2 : 3;
+  const cols = Math.ceil(total / rows);
+  const row  = Math.floor(index / cols);
+  const col  = index % cols;
+  const colsInThisRow = (row === rows - 1)
+    ? (total - row * cols) || cols
+    : cols;
 
-  const arcDeg = Math.min(110, Math.max(50, cols * 16));
-  const arcRad = THREE.MathUtils.degToRad(arcDeg);
-  const angle  = cols > 1
-    ? -arcRad / 2 + (col / (cols - 1)) * arcRad
+  // Spacing math: at radius `distance`, each panel needs at least
+  // (HABIT_W + gap) / distance radians to sit edge-to-edge with a gap.
+  const distance = 1.5;
+  const minAnglePerPanel = (HABIT_W + 0.10) / distance; // ~0.36 rad ≈ 21°
+  const arcRad = Math.max(
+    THREE.MathUtils.degToRad(40),
+    minAnglePerPanel * Math.max(1, colsInThisRow - 1) + THREE.MathUtils.degToRad(8)
+  );
+
+  const angle = colsInThisRow > 1
+    ? -arcRad / 2 + (col / (colsInThisRow - 1)) * arcRad
     : 0;
 
-  const distance = 0.95;
-  const baseY    = 1.30;
-  const rowGap   = 0.18;
-  const y = baseY + (useTwoRows ? (row === 0 ? rowGap / 2 : -rowGap / 2) : 0);
+  const baseY  = 1.40;
+  const rowGap = 0.17;
+  // Top row above baseY, bottom row below, middle row at baseY (for 3 rows)
+  const yOffset = rows === 1
+    ? 0
+    : rows === 2
+      ? (row === 0 ? rowGap / 2 : -rowGap / 2)
+      : (row - 1) * rowGap; // row 0 → +gap, row 1 → 0, row 2 → -gap
+  const y = baseY + yOffset;
 
   mesh.position.set(
     Math.sin(angle) * distance,
@@ -328,8 +347,9 @@ function positionPanel(mesh, index, total) {
     -Math.cos(angle) * distance
   );
 
-  // Face the user (point through scene origin axis at panel's height)
-  mesh.lookAt(mesh.position.x * 2, mesh.position.y, mesh.position.z * 2);
+  // Face the user. For meshes, lookAt() points the +Z axis (front face of a
+  // PlaneGeometry) AT the target — so we aim at the origin column at panel height.
+  mesh.lookAt(0, mesh.position.y, 0);
 }
 
 function drawPanel(panel) {
