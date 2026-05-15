@@ -13,6 +13,7 @@
 import * as THREE                  from 'three';
 import { VRButton }                 from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { RoundedBoxGeometry }       from 'three/addons/geometries/RoundedBoxGeometry.js';
 
 // ─── Supabase config (shared with dayscore.holmes.love) ─────────────────────
 const SUPABASE_URL      = 'https://kyekshvamhvkhfgkcrrk.supabase.co';
@@ -55,6 +56,7 @@ const RING_TUBE      = 0.018;
 const RING_POSITION  = new THREE.Vector3(0, 1.85, -1.15);
 const HABIT_W        = 0.44;
 const HABIT_H        = 0.11;
+const HABIT_D        = 0.028;  // panel thickness — gives real 3D depth
 const CANVAS_W       = 2048;
 const CANVAS_H       = Math.round(CANVAS_W * (HABIT_H / HABIT_W));
 
@@ -68,9 +70,9 @@ let remoteContent = null;
 let scene, camera, renderer, raycaster;
 let ringTrack, ringFill;
 let scorePlane, scoreCanvas, scoreCtx, scoreTexture;
-let habitPanels = [];      // { mesh, canvas, ctx, texture, habit, hovered }
+let habitPanels = [];      // { group, caseMesh, screenMesh, canvas, ctx, texture, habit, hovered, scale, scaleVel, pressBoost, emissiveTarget }
 let controllers = [];
-let skyMat, sparkleMat;
+let skyMat, sparkleMat, floorMat;
 let lastScoreNormalized = 0;
 let audioCtx = null;
 const clock = new THREE.Clock();
@@ -143,15 +145,7 @@ function initScene() {
   dir.position.set(2, 4, 2);
   scene.add(dir);
 
-  // Subtle floor disk for spatial anchoring
-  const floor = new THREE.Mesh(
-    new THREE.RingGeometry(0.4, 4, 64),
-    new THREE.MeshBasicMaterial({ color: 0x141412, side: THREE.DoubleSide })
-  );
-  floor.rotation.x = -Math.PI / 2;
-  floor.position.y = 0.001;
-  scene.add(floor);
-
+  buildFloor();
   buildSky();
   buildSparkles();
   buildRing();
@@ -259,6 +253,90 @@ function updateScorePlane(score, subtext) {
   c.fillText(subtext.toLowerCase(), w / 2, h / 2 + 180);
 
   scoreTexture.needsUpdate = true;
+}
+
+// ─── Floor (frosted glass with futuristic pattern) ─────────────────────────
+// A flat disc rendered with a shader that combines a faint hex grid,
+// concentric pulse rings flowing outward, twelve radial spokes, a slow
+// central glow, and a soft outer fade so the disc dissolves into the sky.
+function buildFloor() {
+  const FLOOR_VERT = `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `;
+  const FLOOR_FRAG = `
+    uniform float uTime;
+    uniform float uScore;
+    varying vec2 vUv;
+
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+
+    void main() {
+      vec2 c = vUv - vec2(0.5);
+      float r = length(c) * 2.0;
+      if (r > 1.0) discard;
+
+      float ang = atan(c.y, c.x);
+
+      // Base frosted color — cool teal, warms slightly with score.
+      vec3 cool = vec3(0.045, 0.085, 0.115);
+      vec3 warm = vec3(0.18, 0.13, 0.08);
+      vec3 col  = mix(cool, warm, smoothstep(0.0, 0.7, uScore) * 0.5);
+
+      // Concentric pulse rings flowing outward
+      float ringPhase = r * 14.0 - uTime * 0.55;
+      float rings = pow(sin(ringPhase) * 0.5 + 0.5, 10.0);
+      vec3 ringTint = mix(vec3(0.30, 0.65, 0.95), vec3(1.00, 0.75, 0.35), uScore);
+      col += ringTint * rings * 0.35;
+
+      // 12 radial spokes — soft bright lines
+      float spokeMask = pow(1.0 - abs(sin(ang * 6.0)), 90.0);
+      col += vec3(0.35, 0.65, 0.90) * spokeMask * 0.12;
+
+      // Faint hex grid
+      vec2 hp = c * 22.0;
+      vec2 q  = vec2(hp.x * 1.1547005, hp.y + hp.x * 0.5);
+      vec2 qf = fract(q) - 0.5;
+      float hexEdge = smoothstep(0.42, 0.50, max(abs(qf.x), abs(qf.y)));
+      col += vec3(0.12, 0.20, 0.28) * hexEdge * 0.45;
+
+      // Central pulsing core
+      float corePulse = 0.5 + 0.5 * sin(uTime * 1.4);
+      float core = smoothstep(0.28, 0.0, r);
+      col += vec3(0.40, 0.70, 1.00) * core * (0.25 + 0.30 * corePulse);
+
+      // Frosted-glass micro-noise for surface texture
+      float n = hash(floor(vUv * 1400.0));
+      col += vec3(n - 0.5) * 0.025;
+
+      // Soft outer fade so disc dissolves into the void
+      float alpha = smoothstep(1.0, 0.78, r);
+
+      gl_FragColor = vec4(col, alpha);
+    }
+  `;
+
+  floorMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:  { value: 0 },
+      uScore: { value: 0 },
+    },
+    vertexShader:   FLOOR_VERT,
+    fragmentShader: FLOOR_FRAG,
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(3.0, 96), floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = 0.001;
+  scene.add(floor);
 }
 
 // ─── Sky dome (score-reactive gradient) ────────────────────────────────────
@@ -428,6 +506,7 @@ function updateScoreVisuals(score, subtext) {
   lastScoreNormalized = normalized;
   if (skyMat)     skyMat.uniforms.uScore.value     = normalized;
   if (sparkleMat) sparkleMat.uniforms.uScore.value = normalized;
+  if (floorMat)   floorMat.uniforms.uScore.value   = normalized;
 }
 
 // ─── Audio (Web Audio synth — no asset file) ───────────────────────────────
@@ -481,11 +560,19 @@ function playMagicChime() {
 }
 
 // ─── Habit panels ───────────────────────────────────────────────────────────
+// Each panel is a Group with two children:
+//   • caseMesh   — RoundedBoxGeometry, gives real 3D depth + rounded corners.
+//                  Lit via MeshStandardMaterial so the side faces shade.
+//   • screenMesh — a Plane with the canvas texture, floating just in front
+//                  of the case (so it reads as the "screen" of a device).
+// Hover and press are driven by a damped spring on `scale` (see tick()).
 function buildHabitPanels(habits) {
   habitPanels.forEach(p => {
-    scene.remove(p.mesh);
-    p.mesh.geometry.dispose();
-    p.mesh.material.dispose();
+    scene.remove(p.group);
+    p.caseMesh.geometry.dispose();
+    p.caseMesh.material.dispose();
+    p.screenMesh.geometry.dispose();
+    p.screenMesh.material.dispose();
     p.texture.dispose();
   });
   habitPanels = [];
@@ -495,7 +582,7 @@ function buildHabitPanels(habits) {
   enriched.forEach((habit, i) => {
     const panel = buildPanel(habit, i, enriched.length);
     habitPanels.push(panel);
-    scene.add(panel.mesh);
+    scene.add(panel.group);
   });
 
   const score = calcScore(enriched);
@@ -512,25 +599,50 @@ function buildPanel(habit, index, total) {
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = 4;
 
-  const mesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(HABIT_W, HABIT_H),
+  // Rounded 3D case — the physical "device" backing
+  const caseMesh = new THREE.Mesh(
+    new RoundedBoxGeometry(HABIT_W, HABIT_H, HABIT_D, 4, 0.018),
+    new THREE.MeshStandardMaterial({
+      color:    0x2f2f2a,
+      roughness: 0.55,
+      metalness: 0.30,
+      emissive: new THREE.Color(0xebebdf),
+      emissiveIntensity: 0.0,   // dialled up on hover
+    })
+  );
+
+  // Front-facing canvas screen, floating just in front of the case
+  const screenMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(HABIT_W * 0.94, HABIT_H * 0.86),
     new THREE.MeshBasicMaterial({
       map: texture,
       transparent: true,
-      side: THREE.DoubleSide,
       depthWrite: false,
     })
   );
-  mesh.renderOrder = 1;
+  screenMesh.position.z = HABIT_D / 2 + 0.001;
+  screenMesh.renderOrder = 1;
 
-  positionPanel(mesh, index, total);
+  const group = new THREE.Group();
+  group.add(caseMesh);
+  group.add(screenMesh);
 
-  const panel = { mesh, canvas, ctx, texture, habit, hovered: false };
+  positionPanel(group, index, total);
+
+  const panel = {
+    group, caseMesh, screenMesh, canvas, ctx, texture, habit,
+    hovered: false,
+    // Spring state for the bouncy hover/press animation
+    scale:    1.0,
+    scaleVel: 0.0,
+    pressBoost: 0.0,
+    emissiveTarget: 0.0,
+  };
   drawPanel(panel);
   return panel;
 }
 
-function positionPanel(mesh, index, total) {
+function positionPanel(group, index, total) {
   // Layout strategy:
   //   ≤5 habits   → 1 row
   //   6–10 habits → 2 rows
@@ -566,15 +678,15 @@ function positionPanel(mesh, index, total) {
       : (row - 1) * rowGap; // row 0 → +gap, row 1 → 0, row 2 → -gap
   const y = baseY + yOffset;
 
-  mesh.position.set(
+  group.position.set(
     Math.sin(angle) * distance,
     y,
     -Math.cos(angle) * distance
   );
 
-  // Face the user. For meshes, lookAt() points the +Z axis (front face of a
-  // PlaneGeometry) AT the target — so we aim at the origin column at panel height.
-  mesh.lookAt(0, mesh.position.y, 0);
+  // Face the user. For meshes/groups, lookAt() points the +Z axis (front face
+  // of the case + screen) AT the target — aim at the origin column at panel height.
+  group.lookAt(0, group.position.y, 0);
 }
 
 function drawPanel(panel) {
@@ -712,13 +824,9 @@ function onSelectStart(event) {
   const hit = pickPanel(event.target);
   if (!hit) return;
   toggleHabit(hit.panel);
-  pressAnimate(hit.panel.mesh);
-}
-
-function pressAnimate(mesh) {
-  const original = mesh.scale.clone();
-  mesh.scale.multiplyScalar(0.94);
-  setTimeout(() => mesh.scale.copy(original), 110);
+  // Inward "press" impulse — the spring in tick() snaps it back with overshoot
+  hit.panel.pressBoost  = -0.12;
+  hit.panel.scaleVel   -= 0.04;
 }
 
 function pickPanel(controller) {
@@ -727,11 +835,14 @@ function pickPanel(controller) {
   raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
   raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
 
-  const meshes = habitPanels.map(p => p.mesh);
+  // Cast against both the case and the screen plane of every panel
+  const meshes = [];
+  habitPanels.forEach(p => { meshes.push(p.caseMesh, p.screenMesh); });
   const hits = raycaster.intersectObjects(meshes);
   if (hits.length === 0) return null;
-  const panel = habitPanels.find(p => p.mesh === hits[0].object);
-  return { panel, hit: hits[0] };
+  const obj = hits[0].object;
+  const panel = habitPanels.find(p => p.caseMesh === obj || p.screenMesh === obj);
+  return panel ? { panel, hit: hits[0] } : null;
 }
 
 function updateHover() {
@@ -742,11 +853,42 @@ function updateHover() {
   }
   habitPanels.forEach(p => {
     const shouldHover = hitSet.has(p);
+    p.emissiveTarget = shouldHover ? 0.55 : 0.0;
     if (p.hovered !== shouldHover) {
       p.hovered = shouldHover;
       drawPanel(p);
     }
   });
+}
+
+// Damped-spring hover/press animation. Runs on every panel every frame.
+//   - When `hovered`, target scale = 1.08; otherwise 1.0.
+//   - pressBoost is a transient negative offset (kicked by onSelectStart)
+//     that decays back to 0 so the panel bounces in then springs out.
+//   - emissiveIntensity lerps toward emissiveTarget so the case glows
+//     softly on hover.
+const SPRING_STIFFNESS = 0.18;
+const SPRING_DAMPING   = 0.72;
+
+function animatePanels() {
+  for (const p of habitPanels) {
+    const target = (p.hovered ? 1.08 : 1.0) + p.pressBoost;
+
+    // Damped harmonic oscillator on scale
+    p.scaleVel += (target - p.scale) * SPRING_STIFFNESS;
+    p.scaleVel *= SPRING_DAMPING;
+    p.scale    += p.scaleVel;
+    p.group.scale.setScalar(p.scale);
+
+    // Decay press boost back to 0
+    if (p.pressBoost < 0) {
+      p.pressBoost = Math.min(0, p.pressBoost + 0.012);
+    }
+
+    // Lerp emissive intensity for a smooth glow on/off
+    const m = p.caseMesh.material;
+    m.emissiveIntensity += (p.emissiveTarget - m.emissiveIntensity) * 0.18;
+  }
 }
 
 // ─── Toggle (optimistic local update + Supabase write) ──────────────────────
@@ -784,7 +926,9 @@ function tick() {
   const t = clock.getElapsedTime();
   if (skyMat)     skyMat.uniforms.uTime.value     = t;
   if (sparkleMat) sparkleMat.uniforms.uTime.value = t;
+  if (floorMat)   floorMat.uniforms.uTime.value   = t;
   if (renderer.xr.isPresenting) updateHover();
+  animatePanels();
   renderer.render(scene, camera);
 }
 
