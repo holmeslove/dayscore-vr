@@ -33,27 +33,28 @@ No scrolling before 10am (7)
 Cook a real meal (6)
 Wind down before midnight (4)`;
 
-// ─── Palette (mirrors DayScore dark theme) ──────────────────────────────────
+// ─── Palette (DayScore dark, lifted a few stops so panels read in VR) ───────
 const COLORS = {
   bg:           0x0d0d0b,
-  panelBg:      '#161614',
-  panelHover:   '#23231f',
-  panelBorder:  '#252521',
+  panelBg:      '#2a2a26',
+  panelHover:   '#3a3a34',
+  panelBorder:  '#4a4a44',
+  panelHoverBorder: '#ebebdf',
   textPrimary:  '#ebebdf',
   textSecondary:'#a8a89a',
-  textMuted:    '#555550',
-  textDone:     '#3a3a36',
+  textMuted:    '#777770',
+  textDone:     '#5a5a54',
   ringTrack:    0x1e1e1a,
   ringFill:     0xebebdf,
-  checkFill:    '#a8a89a',
+  checkFill:    '#ebebdf',
 };
 
 // ─── Geometry constants ─────────────────────────────────────────────────────
 const RING_RADIUS    = 0.32;
 const RING_TUBE      = 0.018;
-const RING_POSITION  = new THREE.Vector3(0, 1.95, -1.4);
-const HABIT_W        = 0.46;
-const HABIT_H        = 0.11;
+const RING_POSITION  = new THREE.Vector3(0, 1.85, -1.15);
+const HABIT_W        = 0.52;
+const HABIT_H        = 0.13;
 const CANVAS_W       = 2048;
 const CANVAS_H       = Math.round(CANVAS_W * (HABIT_H / HABIT_W));
 
@@ -288,8 +289,14 @@ function buildPanel(habit, index, total) {
 
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(HABIT_W, HABIT_H),
-    new THREE.MeshBasicMaterial({ map: texture, transparent: true })
+    new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
   );
+  mesh.renderOrder = 1;
 
   positionPanel(mesh, index, total);
 
@@ -304,15 +311,15 @@ function positionPanel(mesh, index, total) {
   const row  = useTwoRows ? Math.floor(index / cols) : 0;
   const col  = useTwoRows ? index % cols : index;
 
-  const arcDeg = Math.min(150, Math.max(60, cols * 18));
+  const arcDeg = Math.min(110, Math.max(50, cols * 16));
   const arcRad = THREE.MathUtils.degToRad(arcDeg);
   const angle  = cols > 1
     ? -arcRad / 2 + (col / (cols - 1)) * arcRad
     : 0;
 
-  const distance = 1.2;
-  const baseY    = 1.32;
-  const rowGap   = 0.16;
+  const distance = 0.95;
+  const baseY    = 1.30;
+  const rowGap   = 0.18;
   const y = baseY + (useTwoRows ? (row === 0 ? rowGap / 2 : -rowGap / 2) : 0);
 
   mesh.position.set(
@@ -336,10 +343,10 @@ function drawPanel(panel) {
   roundRect(ctx, 0, 0, w, h, 28);
   ctx.fill();
 
-  // Border (brightens on hover)
-  ctx.strokeStyle = hovered ? COLORS.textSecondary : COLORS.panelBorder;
-  ctx.lineWidth   = hovered ? 8 : 4;
-  roundRect(ctx, 4, 4, w - 8, h - 8, 28);
+  // Border (brightens dramatically on hover)
+  ctx.strokeStyle = hovered ? COLORS.panelHoverBorder : COLORS.panelBorder;
+  ctx.lineWidth   = hovered ? 12 : 5;
+  roundRect(ctx, 6, 6, w - 12, h - 12, 26);
   ctx.stroke();
 
   // Layout
@@ -483,16 +490,18 @@ function pickPanel(controller) {
 }
 
 function updateHover() {
-  habitPanels.forEach(p => {
-    if (p.hovered) { p.hovered = false; drawPanel(p); }
-  });
+  const hitSet = new Set();
   for (const ctrl of controllers) {
     const hit = pickPanel(ctrl);
-    if (hit && !hit.panel.hovered) {
-      hit.panel.hovered = true;
-      drawPanel(hit.panel);
-    }
+    if (hit) hitSet.add(hit.panel);
   }
+  habitPanels.forEach(p => {
+    const shouldHover = hitSet.has(p);
+    if (p.hovered !== shouldHover) {
+      p.hovered = shouldHover;
+      drawPanel(p);
+    }
+  });
 }
 
 // ─── Toggle (optimistic local update + Supabase write) ──────────────────────
