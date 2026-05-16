@@ -14,6 +14,8 @@ import * as THREE                  from 'three';
 import { VRButton }                 from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 import { RoundedBoxGeometry }       from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { FontLoader }               from 'three/addons/loaders/FontLoader.js';
+import { TextGeometry }              from 'three/addons/geometries/TextGeometry.js';
 
 // ─── Supabase config (shared with dayscore.holmes.love) ─────────────────────
 const SUPABASE_URL      = 'https://kyekshvamhvkhfgkcrrk.supabase.co';
@@ -51,12 +53,13 @@ const COLORS = {
 };
 
 // ─── Geometry constants ─────────────────────────────────────────────────────
-const RING_RADIUS    = 0.32;
-const RING_TUBE      = 0.018;
-const RING_POSITION  = new THREE.Vector3(0, 1.85, -1.15);
-const HABIT_W        = 0.44;
-const HABIT_H        = 0.11;
-const HABIT_D        = 0.028;  // panel thickness — gives real 3D depth
+const RING_RADIUS    = 0.50;
+const RING_TUBE      = 0.024;
+const RING_POSITION  = new THREE.Vector3(0, 2.30, -2.20);
+const SCORE_POSITION = new THREE.Vector3(0, 2.30, -1.45);  // in front of the ring
+const HABIT_W        = 0.54;
+const HABIT_H        = 0.135;
+const HABIT_D        = 0.032;  // panel thickness — gives real 3D depth
 const CANVAS_W       = 2048;
 const CANVAS_H       = Math.round(CANVAS_W * (HABIT_H / HABIT_W));
 
@@ -69,7 +72,12 @@ let remoteContent = null;
 // ─── Three.js state ─────────────────────────────────────────────────────────
 let scene, camera, renderer, raycaster;
 let ringTrack, ringFill;
-let scorePlane, scoreCanvas, scoreCtx, scoreTexture;
+let scoreMesh = null;            // 3D TextGeometry of the current score (rotating)
+let scoreMaterial = null;
+let scoreFont = null;
+let scoreSpinAngle = 0;
+let lastDisplayedScore = -1;
+let alienSunMat = null;          // shader material for the distant planet (for time uniform)
 let habitPanels = [];      // { group, caseMesh, screenMesh, canvas, ctx, texture, habit, hovered, scale, scaleVel, pressBoost, emissiveTarget }
 let controllers = [];
 let skyMat, sparkleMat, floorMat, tronGridMat;
@@ -164,8 +172,10 @@ function initScene() {
   buildSparkles();
   buildPillars();
   buildFloatingShapes();
+  buildAlienSun();
   buildRing();
-  buildScorePlane();
+  buildScoreMaterial();
+  loadScoreFont();
   setupControllers();
 
   raycaster = new THREE.Raycaster();
@@ -229,50 +239,61 @@ function updateRing(score) {
   ringFill.geometry = new THREE.TorusGeometry(RING_RADIUS, RING_TUBE * 1.12, 18, 96, arc);
 }
 
-// ─── Score plane (sits inside the ring) ─────────────────────────────────────
-function buildScorePlane() {
-  scoreCanvas = document.createElement('canvas');
-  scoreCanvas.width = 512;
-  scoreCanvas.height = 512;
-  scoreCtx = scoreCanvas.getContext('2d');
-
-  scoreTexture = new THREE.CanvasTexture(scoreCanvas);
-  scoreTexture.colorSpace = THREE.SRGBColorSpace;
-
-  const planeSize = RING_RADIUS * 1.7;
-  scorePlane = new THREE.Mesh(
-    new THREE.PlaneGeometry(planeSize, planeSize),
-    new THREE.MeshBasicMaterial({ map: scoreTexture, transparent: true })
-  );
-  scorePlane.position.copy(RING_POSITION);
-  scorePlane.position.z += 0.002;
-  scene.add(scorePlane);
+// ─── 3D rotating score ──────────────────────────────────────────────────────
+// Hero centrepiece: a large extruded numeral in front of the ring. Rebuilt
+// (cheap) whenever the integer score changes; rotated slowly on Y each frame
+// so it's visible from any angle as the user wanders around.
+function buildScoreMaterial() {
+  scoreMaterial = new THREE.MeshStandardMaterial({
+    color:    0xebebdf,
+    emissive: new THREE.Color(0xebebdf),
+    emissiveIntensity: 0.55,
+    roughness: 0.30,
+    metalness: 0.30,
+  });
 }
 
-function updateScorePlane(score, subtext) {
-  const c = scoreCtx;
-  const w = scoreCanvas.width;
-  const h = scoreCanvas.height;
-  c.clearRect(0, 0, w, h);
+function loadScoreFont() {
+  const loader = new FontLoader();
+  loader.load(
+    'https://unpkg.com/three@0.160.0/examples/fonts/helvetiker_bold.typeface.json',
+    (font) => {
+      scoreFont = font;
+      updateScore3D(lastDisplayedScore < 0 ? 0 : lastDisplayedScore);
+    },
+    undefined,
+    () => { /* font load failed — score will simply not appear */ }
+  );
+}
 
-  // Score number
-  c.fillStyle    = COLORS.textPrimary;
-  c.font         = '500 220px "IBM Plex Mono", monospace';
-  c.textAlign    = 'center';
-  c.textBaseline = 'middle';
-  c.fillText(String(Math.round(score)), w / 2, h / 2 - 30);
+function updateScore3D(score) {
+  const intScore = Math.round(score);
+  if (intScore === lastDisplayedScore && scoreMesh) return;
+  lastDisplayedScore = intScore;
+  if (!scoreFont) return;
 
-  // /100 unit
-  c.fillStyle = COLORS.textMuted;
-  c.font      = '500 50px "IBM Plex Mono", monospace';
-  c.fillText('/ 100', w / 2, h / 2 + 100);
+  if (scoreMesh) {
+    scene.remove(scoreMesh);
+    scoreMesh.geometry.dispose();
+    scoreMesh = null;
+  }
 
-  // Subtext
-  c.fillStyle = COLORS.textSecondary;
-  c.font      = '500 34px "IBM Plex Mono", monospace';
-  c.fillText(subtext.toLowerCase(), w / 2, h / 2 + 180);
+  const geo = new TextGeometry(String(intScore), {
+    font: scoreFont,
+    size: 0.42,
+    height: 0.14,
+    curveSegments: 8,
+    bevelEnabled: true,
+    bevelThickness: 0.020,
+    bevelSize: 0.012,
+    bevelSegments: 3,
+  });
+  geo.center();
 
-  scoreTexture.needsUpdate = true;
+  scoreMesh = new THREE.Mesh(geo, scoreMaterial);
+  scoreMesh.position.copy(SCORE_POSITION);
+  scoreMesh.rotation.y = scoreSpinAngle;
+  scene.add(scoreMesh);
 }
 
 // ─── Floor (frosted glass with futuristic pattern) ─────────────────────────
@@ -437,7 +458,7 @@ function buildSky() {
     depthWrite: false,
   });
 
-  const sky = new THREE.Mesh(new THREE.SphereGeometry(40, 48, 32), skyMat);
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(105, 64, 40), skyMat);
   sky.renderOrder = -1; // draw first so everything else composites over it
   scene.add(sky);
 }
@@ -695,6 +716,123 @@ function buildFloatingShapes() {
   }
 }
 
+// ─── Vintage alien sun (distant celestial body) ────────────────────────────
+// A large banded sphere far in the sky with a soft rim halo and two tilted
+// orbital rings — flat-shaded retro-sci-fi feel, à la a Subnautica horizon
+// planet. The bands shift very slowly so it feels alive but not distracting.
+function buildAlienSun() {
+  const SUN_POS = new THREE.Vector3(-26, 24, -78);
+
+  // ── Main body ──
+  const SUN_VERT = `
+    varying vec3 vNormal;
+    varying vec3 vLocal;
+    void main() {
+      vNormal = normalize(normalMatrix * normal);
+      vLocal  = normalize(position);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `;
+  const SUN_FRAG = `
+    uniform float uTime;
+    varying vec3 vNormal;
+    varying vec3 vLocal;
+
+    void main() {
+      // Vertical band coordinate (0 south pole → 1 north pole), with a
+      // little x-wiggle so the bands aren't perfectly horizontal.
+      float band = vLocal.y * 0.5 + 0.5;
+      band += sin(vLocal.x * 4.0 + uTime * 0.07) * 0.025;
+      band += sin(vLocal.z * 3.0 - uTime * 0.05) * 0.020;
+      band = clamp(band, 0.0, 1.0);
+
+      // Vintage poster palette: deep magenta → red → orange → cream → peach
+      vec3 c0 = vec3(0.42, 0.10, 0.28);  // magenta
+      vec3 c1 = vec3(0.78, 0.18, 0.20);  // red
+      vec3 c2 = vec3(0.96, 0.45, 0.20);  // orange
+      vec3 c3 = vec3(1.00, 0.82, 0.55);  // cream
+      vec3 c4 = vec3(0.98, 0.62, 0.55);  // peach
+
+      vec3 col;
+      if (band < 0.25)      col = mix(c0, c1, band / 0.25);
+      else if (band < 0.50) col = mix(c1, c2, (band - 0.25) / 0.25);
+      else if (band < 0.75) col = mix(c2, c3, (band - 0.50) / 0.25);
+      else                  col = mix(c3, c4, (band - 0.75) / 0.25);
+
+      // Narrow banded striations on top of the gradient
+      float stripe = sin(vLocal.y * 22.0 + sin(vLocal.x * 3.0) * 1.4) * 0.5 + 0.5;
+      stripe = pow(stripe, 3.0);
+      col = mix(col, col * 1.18, stripe * 0.45);
+
+      // Soft rim shading so the silhouette glows slightly
+      float rim = 1.0 - abs(vNormal.z);
+      col += vec3(1.0, 0.55, 0.40) * pow(rim, 3.0) * 0.35;
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  alienSunMat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 } },
+    vertexShader:   SUN_VERT,
+    fragmentShader: SUN_FRAG,
+  });
+
+  const sun = new THREE.Mesh(new THREE.SphereGeometry(11, 64, 48), alienSunMat);
+  sun.position.copy(SUN_POS);
+  sun.rotation.z = 0.25;  // slight axial tilt
+  scene.add(sun);
+
+  // ── Atmospheric halo (Fresnel-style rim glow) ──
+  const HALO_FRAG = `
+    varying vec3 vNormal;
+    varying vec3 vWorldPos;
+    void main() {
+      vec3 viewDir = normalize(cameraPosition - vWorldPos);
+      float fres = 1.0 - abs(dot(normalize(vNormal), viewDir));
+      fres = pow(fres, 2.2);
+      vec3 col = vec3(1.0, 0.55, 0.40);
+      gl_FragColor = vec4(col, fres * 0.55);
+    }
+  `;
+  const HALO_VERT = `
+    varying vec3 vNormal;
+    varying vec3 vWorldPos;
+    void main() {
+      vNormal = normalize(normalMatrix * normal);
+      vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `;
+  const haloMat = new THREE.ShaderMaterial({
+    vertexShader:   HALO_VERT,
+    fragmentShader: HALO_FRAG,
+    transparent: true,
+    side: THREE.BackSide,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const halo = new THREE.Mesh(new THREE.SphereGeometry(12.5, 48, 36), haloMat);
+  halo.position.copy(SUN_POS);
+  scene.add(halo);
+
+  // ── Two tilted orbital rings ──
+  const ringColors = [0xff8a4a, 0xffce6a];
+  ringColors.forEach((col, i) => {
+    const ringGeo = new THREE.TorusGeometry(13.0 + i * 1.2, 0.10, 8, 96);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: col,
+      transparent: true,
+      opacity: 0.55 - i * 0.15,
+    });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.copy(SUN_POS);
+    ring.rotation.x = Math.PI / 2.6 + i * 0.10;
+    ring.rotation.z = 0.20 - i * 0.05;
+    scene.add(ring);
+  });
+}
+
 function updatePillars(t, scoreNorm) {
   for (const p of pillars) {
     p.mesh.position.y = p.baseY + Math.sin(t * 0.7 + p.phase) * 0.12;
@@ -756,7 +894,7 @@ window.addEventListener('click', () => {
 // ─── Score → visuals (single source of truth for ring, score, sky, sparkles) ─
 function updateScoreVisuals(score, subtext) {
   updateRing(score);
-  updateScorePlane(score, subtext);
+  updateScore3D(score);
   const normalized = Math.max(0, Math.min(1, score / 100));
   lastScoreNormalized = normalized;
   if (skyMat)      skyMat.uniforms.uScore.value      = normalized;
@@ -815,6 +953,35 @@ function playMagicChime() {
   });
 }
 
+// Mirror of playMagicChime — descending arpeggio E6→C5, slightly softer, no
+// shimmer partial. Plays when a habit is unchecked.
+function playUncheckChime() {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume();
+  const now = ctx.currentTime;
+
+  const master = ctx.createGain();
+  master.gain.value = 0.42;
+  master.connect(ctx.destination);
+
+  const notes = [1318.5, 1046.5, 783.99, 659.25, 523.25]; // descending
+  notes.forEach((freq, i) => {
+    const start = now + i * 0.040;
+    const end   = start + 0.45;
+    const osc   = ctx.createOscillator();
+    const gain  = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(0.13, start + 0.010);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+    osc.connect(gain).connect(master);
+    osc.start(start);
+    osc.stop(end + 0.02);
+  });
+}
+
 // ─── Habit panels ───────────────────────────────────────────────────────────
 // Each panel is a Group with two children:
 //   • caseMesh   — RoundedBoxGeometry, gives real 3D depth + rounded corners.
@@ -829,7 +996,10 @@ function buildHabitPanels(habits) {
     p.caseMesh.material.dispose();
     p.screenMesh.geometry.dispose();
     p.screenMesh.material.dispose();
+    p.backScreenMesh.geometry.dispose();
+    p.backScreenMesh.material.dispose();
     p.texture.dispose();
+    p.backTexture.dispose();
   });
   habitPanels = [];
 
@@ -879,20 +1049,54 @@ function buildPanel(habit, index, total) {
   screenMesh.position.z = HABIT_D / 2 + 0.001;
   screenMesh.renderOrder = 1;
 
+  // Back-facing screen: same texture, rotated 180° around Y so the front face
+  // points behind the case. We also mirror the UVs so the text reads correctly
+  // when viewed from the back.
+  const backTexture = new THREE.CanvasTexture(canvas);
+  backTexture.colorSpace = THREE.SRGBColorSpace;
+  backTexture.anisotropy = 4;
+  backTexture.wrapS = THREE.RepeatWrapping;
+  backTexture.repeat.x = -1;       // horizontal mirror
+  backTexture.offset.x = 1;        // shift so mirrored uv stays in 0..1
+  const backScreenMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(HABIT_W * 0.94, HABIT_H * 0.86),
+    new THREE.MeshBasicMaterial({
+      map: backTexture,
+      transparent: true,
+      depthWrite: false,
+    })
+  );
+  backScreenMesh.position.z = -(HABIT_D / 2 + 0.001);
+  backScreenMesh.rotation.y = Math.PI;
+  backScreenMesh.renderOrder = 1;
+
   const group = new THREE.Group();
   group.add(caseMesh);
   group.add(screenMesh);
+  group.add(backScreenMesh);
 
   positionPanel(group, index, total);
 
   const panel = {
-    group, caseMesh, screenMesh, canvas, ctx, texture, habit,
+    group, caseMesh, screenMesh, backScreenMesh, canvas, ctx,
+    texture, backTexture, habit,
     hovered: false,
     // Spring state for the bouncy hover/press animation
     scale:    1.0,
     scaleVel: 0.0,
     pressBoost: 0.0,
     emissiveTarget: 0.0,
+    // Drift state (recorded after positionPanel so basePos/baseQuat are correct)
+    basePos:  group.position.clone(),
+    baseQuat: group.quaternion.clone(),
+    drift: {
+      pA: [Math.random()*6.28, Math.random()*6.28, Math.random()*6.28],
+      pF: [0.05 + Math.random()*0.07, 0.04 + Math.random()*0.06, 0.05 + Math.random()*0.07],
+      pAmp: [0.045, 0.030, 0.040],
+      rA: [Math.random()*6.28, Math.random()*6.28, Math.random()*6.28],
+      rF: [0.06 + Math.random()*0.07, 0.05 + Math.random()*0.07, 0.04 + Math.random()*0.06],
+      rAmp: [0.045, 0.045, 0.035],
+    },
   };
   drawPanel(panel);
   return panel;
@@ -913,19 +1117,19 @@ function positionPanel(group, index, total) {
 
   // Spacing math: at radius `distance`, each panel needs at least
   // (HABIT_W + gap) / distance radians to sit edge-to-edge with a gap.
-  const distance = 1.5;
-  const minAnglePerPanel = (HABIT_W + 0.10) / distance; // ~0.36 rad ≈ 21°
+  const distance = 2.05;
+  const minAnglePerPanel = (HABIT_W + 0.14) / distance; // ~0.33 rad ≈ 19°
   const arcRad = Math.max(
-    THREE.MathUtils.degToRad(40),
-    minAnglePerPanel * Math.max(1, colsInThisRow - 1) + THREE.MathUtils.degToRad(8)
+    THREE.MathUtils.degToRad(45),
+    minAnglePerPanel * Math.max(1, colsInThisRow - 1) + THREE.MathUtils.degToRad(10)
   );
 
   const angle = colsInThisRow > 1
     ? -arcRad / 2 + (col / (colsInThisRow - 1)) * arcRad
     : 0;
 
-  const baseY  = 1.40;
-  const rowGap = 0.17;
+  const baseY  = 1.30;
+  const rowGap = 0.24;
   // Top row above baseY, bottom row below, middle row at baseY (for 3 rows)
   const yOffset = rows === 1
     ? 0
@@ -1024,6 +1228,7 @@ function drawPanel(panel) {
   ctx.fillText(ptsText, w - padX, cy);
 
   panel.texture.needsUpdate = true;
+  if (panel.backTexture) panel.backTexture.needsUpdate = true;
 }
 
 function roundRect(ctx, x, y, w, h, r) {
@@ -1126,6 +1331,10 @@ function updateHover() {
 const SPRING_STIFFNESS = 0.18;
 const SPRING_DAMPING   = 0.72;
 
+// Per-frame helpers reused across all panels (avoid allocations)
+const _wobbleEuler = new THREE.Euler();
+const _wobbleQuat  = new THREE.Quaternion();
+
 function animatePanels() {
   for (const p of habitPanels) {
     const target = (p.hovered ? 1.08 : 1.0) + p.pressBoost;
@@ -1140,6 +1349,22 @@ function animatePanels() {
     if (p.pressBoost < 0) {
       p.pressBoost = Math.min(0, p.pressBoost + 0.012);
     }
+
+    // Gentle aimless drift — small positional sway + small rotational wobble.
+    // Each axis has its own phase + frequency so panels look uncorrelated.
+    const d = p.drift;
+    p.group.position.set(
+      p.basePos.x + Math.sin(elapsedTime * d.pF[0] + d.pA[0]) * d.pAmp[0],
+      p.basePos.y + Math.sin(elapsedTime * d.pF[1] + d.pA[1]) * d.pAmp[1],
+      p.basePos.z + Math.sin(elapsedTime * d.pF[2] + d.pA[2]) * d.pAmp[2]
+    );
+    _wobbleEuler.set(
+      Math.sin(elapsedTime * d.rF[0] + d.rA[0]) * d.rAmp[0],
+      Math.sin(elapsedTime * d.rF[1] + d.rA[1]) * d.rAmp[1],
+      Math.sin(elapsedTime * d.rF[2] + d.rA[2]) * d.rAmp[2]
+    );
+    _wobbleQuat.setFromEuler(_wobbleEuler);
+    p.group.quaternion.copy(p.baseQuat).multiply(_wobbleQuat);
 
     // Lerp emissive intensity for a smooth glow on/off
     const m = p.caseMesh.material;
@@ -1166,8 +1391,9 @@ function toggleHabit(panel) {
   habit.done = !habit.done;
   drawPanel(panel);
 
-  // Celebrate on the upward toggle only
+  // Different chime depending on direction of toggle
   if (habit.done) playMagicChime();
+  else            playUncheckChime();
 
   // Recompute score from the freshly-toggled content
   const enriched = enrichWithPoints(parse(remoteContent));
@@ -1239,8 +1465,15 @@ function tick() {
   if (sparkleMat)  sparkleMat.uniforms.uTime.value  = elapsedTime;
   if (floorMat)    floorMat.uniforms.uTime.value    = elapsedTime;
   if (tronGridMat) tronGridMat.uniforms.uTime.value = elapsedTime;
+  if (alienSunMat) alienSunMat.uniforms.uTime.value = elapsedTime;
   updatePillars(elapsedTime, lastScoreNormalized);
   updateFloatingShapes(elapsedTime, dt, lastScoreNormalized);
+
+  // Slow Y rotation on the 3D score so it's visible from any angle
+  if (scoreMesh) {
+    scoreSpinAngle += dt * 0.22;
+    scoreMesh.rotation.y = scoreSpinAngle;
+  }
   if (renderer.xr.isPresenting) {
     updateHover();
     handleLocomotion(dt);
